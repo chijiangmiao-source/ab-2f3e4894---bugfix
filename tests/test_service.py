@@ -41,8 +41,11 @@ class ServiceTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp.name, "duty.db")
+        # 设备侧驱动台账持久化在文件中：载荷是独立硬件，地面值班进程重启
+        # 不会抹掉设备已经执行过的动作；恢复裁决必须跨进程可观测。
+        self.journal_path = os.path.join(self.tmp.name, "device-drive.jsonl")
         self.clock = FakeClock()
-        self.device = PayloadDevice()
+        self.device = PayloadDevice(self.journal_path)
         self.store = Store(self.db_path, "test-key")
         self.store.recover(self.clock())
         self.cfg = SimpleNamespace(crash_before_persist=False,
@@ -73,11 +76,14 @@ class ServiceTestBase(unittest.TestCase):
         return body
 
     def reopen_service(self, cfg=None) -> DutyService:
-        """模拟重启：重新打开数据库并完成启动恢复。"""
+        """模拟重启：重新打开数据库并完成启动恢复。
+
+        载荷设备台账沿用同一持久文件：硬件动作不随地面值班进程重启而消失。
+        """
         store = Store(self.db_path, "test-key")
         recovery = store.recover(self.clock())
         self._last_recovery = recovery
-        device = PayloadDevice()
+        device = PayloadDevice(self.journal_path)
         return DutyService(store, device, cfg or self.cfg,
                            clock=self.clock, exiter=crash_exiter), store, \
             device, recovery
@@ -346,28 +352,98 @@ class TestConcurrentExecution(ServiceTestBase):
 
 
 class TestCrashRecovery(ServiceTestBase):
-    def test_crash_before_result_persist_recovers_to_retryable(self):
+    def test_crash_before_result_persist_retry_confirms_without_redrive(self):
+        """核心回归：动作已发生、结果未落盘即断电；恢复后重试同一稳定
+        操作标识必须被识别为首次操作的延续——回放/确认首次结果，合计
+        只实际驱动载荷一次（跨进程重启成立）。"""
+        crash_cfg = SimpleNamespace(crash_before_persist=True,
+                                    crash_after_persist=False)
+        svc = DutyService(self.store, self.device, crash_cfg,
+                          clock=self.clock, exiter=crash_exiter)
+        svc.create_selection(self.selection_body())
+        # 首次执行：T1 已持久提交、载荷已实际驱动，随后在 T2 前硬退出。
+        with self.assertRaises(_Crash):
+            svc.execute(self.execution_body())
+        self.assertEqual(self.device.drive_count("OP-A"), 1,
+                         "断电前载荷应已被实际驱动一次")
+
+        # —— 重启（地面值班进程全新生命周期；设备台账持久保留）——
+        svc2, store2, device2, recovery = self.reopen_service()
+        self.assertEqual(len(recovery["recovered_executions"]), 1,
+                         "重启必须把悬空执行恢复为 RECOVERING，而不是删除")
+        self.assertEqual(recovery["rolled_back_executions"], [])
+        sel = store2.latest_selection_for_device("DEV-1")
+        self.assertEqual(sel["status"], "CONSUMED",
+                         "持久驱动意向必须保留：选择不得回退为 ACTIVE")
+        pending = store2.latest_execution_for_selection(sel["id"])
+        self.assertEqual(pending["state"], "RECOVERING")
+
+        # 以同一稳定操作标识、相同内容重试：确认首次动作，不再次下发。
+        r = svc2.execute(self.execution_body())
+        self.assertEqual(r["state"], "EXECUTED")
+        self.assertTrue(r["replayed"],
+                        "恢复后重试应回放首次动作的结果，而非首次消费")
+        self.assertEqual(r["id"], pending["id"],
+                         "必须延续首次执行记录，不得新建执行")
+        self.assertEqual(device2.drive_count("OP-A"), 1,
+                         "首次动作与恢复重试合计只能实际驱动一次")
+        # 业务结论一致：结果由 (device, op, summary) 确定。
+        from app.device import deterministic_result
+        self.assertEqual(
+            r["result"], deterministic_result("DEV-1", "OP-A",
+                                              "ARM 红外载荷"))
+
+        # 再次重试仍是同一终态回放，不再驱动。
+        r2 = svc2.execute(self.execution_body())
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["id"], r["id"])
+        self.assertEqual(r2["result"], r["result"])
+        self.assertEqual(device2.drive_count("OP-A"), 1)
+        store2.close()
+
+    def test_retry_with_same_request_id_after_crash_replays_same_final(self):
+        """首试与恢复重试携带同一执行请求标识时，也命中同一终态记录。"""
         crash_cfg = SimpleNamespace(crash_before_persist=True,
                                     crash_after_persist=False)
         svc = DutyService(self.store, self.device, crash_cfg,
                           clock=self.clock, exiter=crash_exiter)
         svc.create_selection(self.selection_body())
         with self.assertRaises(_Crash):
-            svc.execute(self.execution_body())
+            svc.execute(self.execution_body(request_id="EXE-RC"))
 
-        # —— 重启 ——
-        svc2, store2, device2, recovery = self.reopen_service()
-        self.assertEqual(len(recovery["rolled_back_executions"]), 1,
-                         "重启必须回滚落盘前遗留的悬空执行")
-        sel = store2.latest_selection_for_device("DEV-1")
-        self.assertEqual(sel["status"], "ACTIVE",
-                         "落盘前断电必须恢复为可安全重试的未执行态")
-        self.assertIsNone(
-            store2.latest_execution_for_selection(sel["id"]))
-        # 安全重试成功。
-        r = svc2.execute(self.execution_body())
+        svc2, store2, device2, _ = self.reopen_service()
+        r = svc2.execute(self.execution_body(request_id="EXE-RC"))
         self.assertEqual(r["state"], "EXECUTED")
-        self.assertFalse(r["replayed"])
+        self.assertTrue(r["replayed"])
+        self.assertEqual(device2.drive_count("OP-A"), 1)
+        # 此后按该请求标识继续重传，仍回放同一条记录。
+        r2 = svc2.execute(self.execution_body(request_id="EXE-RC"))
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["id"], r["id"])
+        self.assertEqual(device2.drive_count("OP-A"), 1)
+        store2.close()
+
+    def test_crash_between_t1_and_bus_send_drives_exactly_once(self):
+        """断电窗口另一边界：T1 已提交但总线发送前退出（设备侧无记录）。
+
+        恢复后无副作用确认判定确未下发，此时允许补发——整个链路仍恰好
+        驱动一次，不会因补发产生重复动作。
+        """
+        self.svc.create_selection(self.selection_body())
+        sel = self.store.latest_selection_for_device("DEV-1")
+        # 手工制造“T1 已落盘、设备尚未驱动”的悬空状态。
+        self.store.insert_executing(sel, "EXE-GAP", self.clock())
+        self.assertEqual(self.device.drive_count("OP-A"), 0)
+
+        svc2, store2, device2, recovery = self.reopen_service()
+        self.assertEqual(len(recovery["recovered_executions"]), 1)
+        r = svc2.execute(self.execution_body(request_id="EXE-GAP"))
+        self.assertEqual(r["state"], "EXECUTED")
+        self.assertFalse(r["replayed"], "确认设备确未下发时应补发一次")
+        self.assertEqual(device2.drive_count("OP-A"), 1)
+        r2 = svc2.execute(self.execution_body(request_id="EXE-GAP"))
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["id"], r["id"])
         self.assertEqual(device2.drive_count("OP-A"), 1)
         store2.close()
 
@@ -380,15 +456,19 @@ class TestCrashRecovery(ServiceTestBase):
         with self.assertRaises(_Crash):
             svc.execute(self.execution_body())
 
-        # 重启前时间已越过失效时刻。
+        # 重启前时间已越过失效时刻：授权窗口已过，回滚为 EXPIRED。
         self.clock.advance(2000)
-        svc2, store2, _, _ = self.reopen_service()
+        svc2, store2, device2, recovery = self.reopen_service()
+        self.assertEqual(recovery["recovered_executions"], [])
+        self.assertEqual(len(recovery["rolled_back_executions"]), 1)
         sel = store2.latest_selection_for_device("DEV-1")
         self.assertEqual(sel["status"], "EXPIRED",
                          "重启时已过期的悬空选择应恢复为 EXPIRED")
         with self.assertRaises(ApiError) as cm:
             svc2.execute(self.execution_body())
         self.assertEqual(cm.exception.code, "SELECTION_EXPIRED")
+        # 过期拒绝路径不得再次驱动设备。
+        self.assertEqual(device2.drive_count("OP-A"), 1)
         store2.close()
 
     def test_crash_after_result_persist_replays_executed(self):
@@ -402,12 +482,15 @@ class TestCrashRecovery(ServiceTestBase):
 
         # —— 重启 ——
         svc2, store2, device2, recovery = self.reopen_service()
+        self.assertEqual(recovery["recovered_executions"], [])
         self.assertEqual(recovery["rolled_back_executions"], [])
         sel = store2.latest_selection_for_device("DEV-1")
         self.assertEqual(sel["status"], "CONSUMED",
                          "落盘后断电必须恢复为可回放的已执行态")
         exe = store2.latest_execution_for_selection(sel["id"])
         self.assertEqual(exe["state"], "EXECUTED")
+        before = device2.drive_count("OP-A")
+        self.assertEqual(before, 1, "断电前的首次驱动保留在设备台账中")
         # 重传回放同一最终结果。
         r = svc2.execute(self.execution_body(summary="高危指令"))
         self.assertTrue(r["replayed"])
@@ -415,6 +498,8 @@ class TestCrashRecovery(ServiceTestBase):
         self.assertEqual(
             r["result"]["receipt"],
             json.loads(exe["result_json"])["receipt"])
+        self.assertEqual(device2.drive_count("OP-A"), before,
+                         "回放不得再次驱动设备")
         # 已成功执行后不得再次选择（即使字段变化）。
         with self.assertRaises(ApiError) as cm:
             svc2.create_selection(
@@ -423,8 +508,6 @@ class TestCrashRecovery(ServiceTestBase):
         # 旧选择不得复活。
         self.assertEqual(
             store2.find_selection(sel["id"])["status"], "CONSUMED")
-        self.assertEqual(device2.drive_count("OP-A"), 0,
-                         "回放不得再次驱动设备")
         store2.close()
 
     def test_old_selection_not_revived_after_restart(self):

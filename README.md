@@ -34,14 +34,20 @@
 ### 断电恢复
 执行落盘分两段事务（WAL + `synchronous=FULL`）：
 - **T1**：写 `execution(EXECUTING)` 并把选择置为 `CONSUMED`（同一事务）。
+  T1 即该高危命令的**持久驱动意向**：提交后设备可能已实际动作。
 - **T2**：写 `execution(EXECUTED, result)`。
 
 | 注入点 | 磁盘状态 | 重启恢复 |
 |--------|----------|----------|
-| 结果落盘**前**（设备已驱动、T2 前） | 悬空 EXECUTING + CONSUMED | 回滚为 **ACTIVE 未执行**；设备按 op_id 幂等，可安全重试并得到同一确定结果 |
+| 结果落盘**前**（设备已驱动、T2 前） | 悬空 EXECUTING + CONSUMED | 执行转 **RECOVERING**、选择保持 **CONSUMED**（不删除驱动意向）；同一稳定操作标识重试时先对设备做**无副作用确认**——首次动作已发生则采信其确定结果完成 T2 并回放，**绝不二次下发**；仅当设备侧确无下发记录时补发一次 |
 | 结果落盘**后**（T2 提交后） | EXECUTED + CONSUMED | 恢复为 **CONSUMED 已执行**，重传回放同一结果 |
 
-- 启动恢复会：校验全部持久记录 → 回滚所有悬空 EXECUTING → 标记到点选择过期。
+- 重启时已过失效时刻的悬空执行例外回滚为 `EXPIRED`（超出授权窗口）。
+- “设备是否已驱动”由**设备侧持久驱动台账**（`DUTY_DEVICE_JOURNAL_PATH`，
+  fsync 的 JSONL）跨进程提供：确认只读台账、不产生任何总线动作；
+  首次动作与恢复重试合计至多实际驱动载荷一次。
+- 启动恢复会：校验全部持久记录 → 悬空 EXECUTING 转为 RECOVERING（已过期者
+  回滚）→ 标记到点选择过期。
 - 每条记录带 **HMAC-SHA256**（绑定表名与全部字段，`DUTY_MAC_KEY`）。
   记录被篡改/缺失 MAC/不可读时：
   - `GET /health` 返回 **503 `degraded`** 并列出 `integrity_errors`；
@@ -112,8 +118,8 @@ docker compose logs verify        # 查看逐条验收结果
 app/
   config.py    运行配置与崩溃注入开关
   security.py  记录级 HMAC 完整性保护
-  store.py     SQLite 持久化、两段式落盘与启动恢复
-  device.py    载荷设备模拟器（按稳定操作标识幂等，结果确定可重放）
+  store.py     SQLite 持久化、两段式落盘与启动恢复（RECOVERING 驱动意向）
+  device.py    载荷设备模拟器（持久驱动台账 + 无副作用确认，结果确定可重放）
   service.py   业务规则与并发裁决（每选择一把消费锁）
   httpapi.py   HTTP/JSON 接口
   main.py      进程入口（打开存储→恢复→服务）

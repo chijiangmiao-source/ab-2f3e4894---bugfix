@@ -8,7 +8,10 @@
   * 执行只接受“同操作标识 + 摘要一致 + 仍在有效期”的请求；
   * 并发执行竞争同一选择：仅一个首次消费成功，其余阻塞到终态后
     回放同一最终结果，而不会得到处理中状态；
-  * 在结果落盘前/后注入中断后，启动恢复回放到可安全重试或可回放已执行态；
+  * 在结果落盘前/后注入中断后，启动恢复保留持久驱动意向（RECOVERING），
+    恢复后的同一稳定操作标识先向设备做**无副作用确认**：首次动作已发生
+    则采信其结果完成落盘（回放），绝不重复下发高危命令；仅当确认设备侧
+    确未下发时才补发一次；
   * 存在无法校验的持久记录时服务降级（fail-closed），健康检查反映异常。
 """
 from __future__ import annotations
@@ -166,10 +169,42 @@ class DutyService:
         return self._selection_json(row, replayed=False)
 
     # ---------- 执行 ----------
+    def _resolve_recovering(self, row: Any,
+                            request_id: Optional[str]) -> Dict[str, Any]:
+        """恢复一条“设备可能已驱动、结果尚未落盘”的执行（RECOVERING）。
+
+        这是断电恢复后同一稳定操作标识重试的唯一入口。先向设备做
+        **无副作用确认**：
+          * 首次动作已到达载荷 -> 采信首次动作的确定结果完成 T2，
+            本次重试不产生任何下发，以回放形式返回同一业务结论；
+          * 设备侧确无该操作的下发记录（断电发生在 T1 提交后、总线
+            实际发送前）-> 此时也只允许补发**一次**，随后落盘结果。
+        无论哪种情况，同一稳定操作标识的实际高危下发合计至多一次。
+        """
+        device_id, op_id, summary = (row["device_id"], row["op_id"],
+                                    row["summary"])
+        drove, prior_result = self.device.confirm(device_id, op_id)
+        if drove:
+            # 首次动作已发生：只确认，绝不再次下发。
+            result = prior_result
+            replayed = True
+        else:
+            # 确认设备侧确未下发：补发一次（整个恢复链路中唯一一次下发）。
+            result = self.device.execute(device_id, op_id, summary)
+            replayed = False
+        final_row = self.store.resolve_recovering(
+            row["id"], result, self.now())
+        # 重试可能携带与首次不同（或首次缺失）的请求标识：把幂等索引
+        # 指向同一终态记录，使后续按该标识的重传继续回放同一结果。
+        if request_id:
+            self.store.ensure_execution_request_index(
+                request_id, final_row["id"])
+        return self._execution_json(final_row, replayed=replayed)
+
     def _verdict_for_current(self, row: Any,
                              request_id: Optional[str] = None
                              ) -> Dict[str, Any]:
-        """对一条非 ACTIVE（或刚过期）选择给出终态裁决：回放或拒绝。"""
+        """对一条非 ACTIVE（或刚过期）选择给出终态裁决：恢复/回放或拒绝。"""
         if row["status"] == "EXPIRED" or row["expires_at_ms"] <= self.now():
             raise ApiError(410, "SELECTION_EXPIRED",
                            "选择已过失效时刻，不得执行")
@@ -182,8 +217,13 @@ class DutyService:
                     self.store.ensure_execution_request_index(
                         request_id, final["id"])
                 return self._execution_json(final, replayed=True)
-            # 进程内并发下不可达：消费锁串行化了 T1..T2；
-            # 跨重启的悬空 EXECUTING 已在启动恢复时回滚。
+            if final is not None and final["state"] in (
+                    "RECOVERING", "EXECUTING"):
+                # 断电发生在设备已驱动之后、T2 落盘之前（或同进程 T2 失败）：
+                # 恢复后的同一操作必须延续首次动作——先无副作用确认，
+                # 已驱动则采信结果，绝不重新下发高危命令。
+                return self._resolve_recovering(final, request_id)
+            # 既有记录被完整性流程隔离等异常情况：明确拒绝而非盲目重发。
             raise ApiError(409, "SELECTION_CONSUMED",
                            "选择已被消费且暂无最终结果，请稍后重试")
         raise ApiError(409, "SELECTION_NOT_ACTIVE",
@@ -212,7 +252,8 @@ class DutyService:
                         "相同请求标识的执行重传字段发生变化")
                 if prior["state"] == "EXECUTED":
                     return self._execution_json(prior, replayed=True)
-                # prior 为 EXECUTING：落入下方选择裁决，阻塞到终态后回放。
+                # prior 为 EXECUTING/RECOVERING：落入下方选择裁决，
+                # 在消费锁内阻塞到终态或走无副作用确认，最终拿到同一结果。
 
         latest = self.store.latest_selection_for_device(device_id)
         if latest is None:
@@ -247,7 +288,8 @@ class DutyService:
 
             # —— 中断注入点①：执行结果落盘“之前” ——
             # 设备已驱动、结果已产生，但 T2 尚未提交；
-            # 重启后恢复为可安全重试的未执行态，重试得到同一确定结果。
+            # 重启后 T1 作为持久驱动意向保留为 RECOVERING，同一操作重试
+            # 先无副作用确认首次动作、采信其结果，绝不重新下发高危命令。
             if self.config.crash_before_persist:
                 self._crash(121)
 
@@ -256,8 +298,9 @@ class DutyService:
                 final_row = self.store.finish_execution(
                     execution_id, result, self.now())
             except Exception:
-                # 落盘失败：回到可安全重试的未执行态，不挂起选择。
-                self.store.rollback_executing(execution_id, self.now())
+                # 设备已经实际驱动，绝不能回滚成 ACTIVE 后让重试再下发一次：
+                # 保留持久驱动意向（RECOVERING），后续重试走无副作用确认。
+                self.store.mark_recovering(execution_id, self.now())
                 raise
 
             # —— 中断注入点②：执行结果落盘“之后” ——

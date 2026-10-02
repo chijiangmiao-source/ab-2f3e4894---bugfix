@@ -9,7 +9,9 @@
      - 选择—执行全流程、重传回放与字段冲突、异操作标识拒绝；
      - 两个并发执行竞争同一有效选择（仅一个首次成功、其余回放同一结果）；
      - 过期选择不得执行、旧选择不复活；
-     - 结果落盘“前”注入中断并重启 -> 恢复为可安全重试的未执行态并能重试成功；
+     - 结果落盘“前”注入中断并重启 -> 持久驱动意向保留(RECOVERING)，
+       同一稳定操作标识重试只做无副作用确认、回放首次结果，
+       首次动作与恢复重试合计仅实际驱动载荷一次；
      - 结果落盘“后”注入中断并重启 -> 恢复为可回放的已执行态且回放同一结果。
 
 全部通过退出码 0，任一失败退出码 1。
@@ -336,23 +338,47 @@ def scenario_expiry(target) -> None:
            new["id"] != created["id"] and True)
 
 
+def _device_journal_path(db_dir: str) -> str:
+    return os.path.join(db_dir, "device-drive.jsonl")
+
+
+def read_drive_journal(db_dir: str) -> list[dict]:
+    """读取设备侧持久驱动台账（每次实际下发载荷一条，跨进程累计）。"""
+    path = _device_journal_path(db_dir)
+    if not os.path.exists(path):
+        return []
+    rows: list[dict] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def count_drives(db_dir: str, op_id: str) -> int:
+    return sum(1 for r in read_drive_journal(db_dir) if r["op_id"] == op_id)
+
+
 def scenario_crash_before(db_dir: str) -> None:
-    print("\n- 断电恢复①：执行结果落盘前中断并重启")
+    print("\n- 断电恢复①：动作已发生、结果未落盘即退出，重启后同一操作重试")
     port = free_port()
     db_file = os.path.join(db_dir, "duty.db")
+    op_id = "OP-PRE"
+    summary = "落盘前断电指令"
     srv = Server(db_dir, port, crash_before=True)
     srv.start()
     try:
-        sel = {"device_id": "SAT-P1", "op_id": "OP-PRE",
-               "summary": "落盘前断电指令",
+        sel = {"device_id": "SAT-P1", "op_id": op_id,
+               "summary": summary,
                "expires_at_ms": now_ms() + 60_000}
         st, created = http_request(srv.port, "POST",
                                    "/api/v1/selections", sel)
         record("① 建立选择", st == 201, f"{st} {created}")
-        # 服务应在响应途中以退出码 121 硬中断。
+        # 服务应在响应途中以退出码 121 硬中断（T1 已提交、设备已驱动、T2 前）。
         st, _ = http_request(srv.port, "POST", "/api/v1/executions",
-                             {"device_id": "SAT-P1", "op_id": "OP-PRE",
-                              "summary": "落盘前断电指令"},
+                             {"device_id": "SAT-P1", "op_id": op_id,
+                              "summary": summary},
                              expect_disconnect=True)
         record("① 注入中断后进程退出码 121",
                srv.wait_exit(121), f"poll={srv.proc.poll()}")
@@ -360,23 +386,58 @@ def scenario_crash_before(db_dir: str) -> None:
         if srv.proc and srv.proc.poll() is None:
             srv.proc.kill()
 
-    # 直接从磁盘确认：T1 已落盘（重启前存在悬空执行的证据由恢复日志处理）。
-    # 重启（不带崩溃注入）。
+    # 设备侧持久台账：断电瞬间首次动作已实际到达载荷，恰好 1 次。
+    drives_before = count_drives(db_dir, op_id)
+    record("① 断电前载荷已实际驱动 1 次（设备持久台账）",
+           drives_before == 1, f"drives={drives_before}")
+
+    # 重启（不带崩溃注入）；数据库与设备台账均沿用同一持久目录。
     srv2 = Server(db_dir, port)
     srv2.start()
     try:
+        # 恢复不得删除驱动意向：执行处于 RECOVERING、选择保持 CONSUMED。
+        conn = sqlite3.connect(db_file)
+        state_row = conn.execute(
+            "SELECT e.state, s.status FROM executions e"
+            " JOIN selections s ON s.id=e.selection_id"
+            " WHERE e.op_id=?", (op_id,)).fetchone()
+        conn.close()
+        record("① 重启后悬空执行=RECOVERING 且选择保持 CONSUMED",
+               state_row == ("RECOVERING", "CONSUMED"),
+               f"row={state_row}")
+
         qs = urlencode({"device_id": "SAT-P1"})
         st, got = http_request(srv2.port, "GET",
                                f"/api/v1/selections?{qs}")
-        record("① 重启后恢复为可安全重试的未执行态 (ACTIVE)",
-               st == 200 and got["status"] == "ACTIVE", f"{st} {got}")
+        record("① 选择仍为 CONSUMED（不会被当作未执行而重发）",
+               st == 200 and got["status"] == "CONSUMED", f"{st} {got}")
+
+        # 以同一稳定操作标识、相同内容重试——本断言是本回归的核心。
         st2, exe = http_request(srv2.port, "POST", "/api/v1/executions",
-                                {"device_id": "SAT-P1",
-                                 "op_id": "OP-PRE",
-                                 "summary": "落盘前断电指令"})
-        record("① 安全重试成功 EXECUTED（首次结果）",
-               st2 == 200 and exe["state"] == "EXECUTED"
-               and not exe.get("replayed"), f"{st2} {exe}")
+                                {"device_id": "SAT-P1", "op_id": op_id,
+                                 "summary": summary})
+        first_journal = next(r for r in read_drive_journal(db_dir)
+                             if r["op_id"] == op_id)
+        record("① 恢复重试回放首次结果 (replayed, EXECUTED, 同收据)",
+               st2 == 200 and exe.get("replayed") is True
+               and exe["state"] == "EXECUTED"
+               and exe["result"] == first_journal["result"],
+               f"{st2} {exe}")
+
+        # 再以同一操作重试（换一个请求标识）：仍是同一终态回放。
+        st3, exe3 = http_request(srv2.port, "POST", "/api/v1/executions",
+                                 {"device_id": "SAT-P1", "op_id": op_id,
+                                  "summary": summary,
+                                  "request_id": "pre-retry-2"})
+        record("① 再次重试仍回放同一终态记录",
+               st3 == 200 and exe3.get("replayed") is True
+               and exe3["id"] == exe["id"]
+               and exe3["result"] == exe["result"], f"{st3} {exe3}")
+
+        # 合计实际驱动次数：首次动作 + 恢复重试 == 1（跨进程重启成立）。
+        total = count_drives(db_dir, op_id)
+        record("① 首次动作与恢复重试合计只实际驱动 1 次",
+               total == 1, f"total_drives={total}")
     finally:
         srv2.stop()
 
@@ -427,6 +488,10 @@ def scenario_crash_after(db_dir: str) -> None:
                and exe["state"] == "EXECUTED"
                and exe["result"]["receipt"] == first_receipt,
                f"{st2} {exe}")
+        # 回放不得产生任何新的设备驱动：台账仍只有首次 1 条。
+        record("② 回放后实际驱动仍为 1 次（不重发）",
+               count_drives(db_dir, "OP-POST") == 1,
+               f"drives={count_drives(db_dir, 'OP-POST')}")
         # 已执行后不得再次选择。
         st3, body3 = http_request(
             srv2.port, "POST", "/api/v1/selections",

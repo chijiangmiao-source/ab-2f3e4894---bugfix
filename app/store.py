@@ -4,11 +4,15 @@
   selections.status: ACTIVE -> CONSUMED（执行成功）
                      ACTIVE -> EXPIRED（过期，惰性或恢复时标记）
   executions.state:  EXECUTING -> EXECUTED（结果落盘）
+                     EXECUTING -> RECOVERING（重启恢复：设备可能已驱动）
+                     RECOVERING -> EXECUTED（恢复后确认/补发并落盘结果）
 
 落盘分两段事务：
   T1 写 execution(EXECUTING) + selection(CONSUMED) 并提交；
   T2 写 execution(EXECUTED, result) 并提交。
-T1 后 T2 前断电 -> 重启时发现悬空 EXECUTING，回滚为可安全重试的未执行态；
+T1 后 T2 前断电 -> T1 代表“高危命令已取得持久驱动意向”，重启时**不得删除**：
+  执行转为 RECOVERING、选择保持 CONSUMED，由业务层先向设备做无副作用确认，
+  已驱动则采信首次结果完成 T2，绝不重复下发；仅当重启时选择已过期才回滚。
 T2 后断电 -> EXECUTED 已落盘，重启后原样回放裁决。
 
 每行入库时在同一事务内用真实主键重算 HMAC 后提交，保证崩溃后任何
@@ -140,6 +144,16 @@ class Store:
                           (mac, rid))
 
     # ---------- 恢复 ----------
+    def _set_execution_state_locked(self, ex: sqlite3.Row,
+                                    state: str) -> None:
+        """锁内：更新执行状态并重算 MAC。"""
+        d = dict(ex)
+        d["state"] = state
+        d.pop("mac", None)
+        self.conn.execute(
+            "UPDATE executions SET state=?, mac=? WHERE id=?",
+            (state, self._mac("executions", d), ex["id"]))
+
     def _rollback_executing_locked(self, ex: sqlite3.Row,
                                    now_ms: int) -> Optional[str]:
         """锁内：删除悬空 EXECUTING 并恢复选择状态。返回选择新状态。"""
@@ -168,6 +182,33 @@ class Store:
                        ensure_ascii=False))
         return new_status
 
+    def _recover_executing_locked(self, ex: sqlite3.Row,
+                                  now_ms: int) -> str:
+        """把悬空 EXECUTING 转为 RECOVERING，保留持久驱动意向。
+
+        T1 提交意味着该高危命令已取得持久驱动意向，设备可能已实际动作，
+        删除记录会让恢复后的重试无从识别这是同一操作的延续，从而把高危
+        命令再次下发。业务层随后只能以无副作用确认采信首次结果，或在
+        确认“确未下发”时补发一次。
+
+        选择在重启时刻已过期的例外：动作即使发生也已超出业务授权窗口，
+        按原逻辑回滚为 EXPIRED 并删除悬空执行。
+        """
+        sel = self.conn.execute(
+            "SELECT * FROM selections WHERE id=?",
+            (ex["selection_id"],)).fetchone()
+        if sel is not None and sel["expires_at_ms"] <= now_ms:
+            self._rollback_executing_locked(ex, now_ms)
+            return "rolled_back"
+        self._set_execution_state_locked(ex, "RECOVERING")
+        self._log_recovery_locked(
+            now_ms, "recover_dangling_execution",
+            json.dumps({"execution_id": ex["id"],
+                        "selection_id": ex["selection_id"],
+                        "state": "RECOVERING"},
+                       ensure_ascii=False))
+        return "recovering"
+
     def rollback_executing(self, execution_id: int,
                            now_ms: int) -> Optional[str]:
         """删除一条悬空 EXECUTING，选择回到可安全重试态。返回选择新状态。"""
@@ -185,9 +226,82 @@ class Store:
                 raise
         return new_status
 
+    def mark_recovering(self, execution_id: int,
+                        now_ms: int) -> Optional[sqlite3.Row]:
+        """EXECUTING -> RECOVERING：设备已驱动但 T2 失败时保留驱动意向。"""
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                ex = self.conn.execute(
+                    "SELECT * FROM executions WHERE id=?",
+                    (execution_id,)).fetchone()
+                if ex is not None and ex["state"] in (
+                        "EXECUTING", "RECOVERING"):
+                    self._set_execution_state_locked(ex, "RECOVERING")
+                    self._log_recovery_locked(
+                        now_ms, "mark_recovering_after_persist_failure",
+                        json.dumps({"execution_id": execution_id},
+                                   ensure_ascii=False))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        if ex is None:
+            return None
+        return self.conn.execute("SELECT * FROM executions WHERE id=?",
+                                 (execution_id,)).fetchone()
+
+    def resolve_recovering(self, execution_id: int,
+                           result: Dict[str, Any], now_ms: int) -> sqlite3.Row:
+        """RECOVERING/EXECUTING -> EXECUTED：把确认/补发到的结果落盘（T2）。"""
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute(
+                    "SELECT * FROM executions WHERE id=?",
+                    (execution_id,)).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"待恢复执行不存在: id={execution_id}")
+                if row["state"] not in ("RECOVERING", "EXECUTING"):
+                    self.conn.execute("COMMIT")
+                    return self.conn.execute(
+                        "SELECT * FROM executions WHERE id=?",
+                        (execution_id,)).fetchone()
+                result_json = json.dumps(result, ensure_ascii=False,
+                                         sort_keys=True)
+                self.conn.execute(
+                    "UPDATE executions SET state='EXECUTED', result_json=?,"
+                    " finished_at_ms=? WHERE id=?",
+                    (result_json, now_ms, execution_id))
+                final = self.conn.execute(
+                    "SELECT * FROM executions WHERE id=?",
+                    (execution_id,)).fetchone()
+                d = dict(final)
+                d.pop("mac", None)
+                self.conn.execute(
+                    "UPDATE executions SET mac=? WHERE id=?",
+                    (self._mac("executions", d), execution_id))
+                req_id = final["request_id"]
+                if req_id:
+                    idx = {"kind": "execution", "request_id": req_id,
+                           "record_id": execution_id}
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO request_index(kind,"
+                        " request_id, record_id, mac) VALUES (?,?,?,?)",
+                        ("execution", req_id, execution_id,
+                         self._mac("request_index", idx)))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return self.conn.execute("SELECT * FROM executions WHERE id=?",
+                                 (execution_id,)).fetchone()  # type: ignore
+
     def recover(self, now_ms: int) -> Dict[str, Any]:
-        """启动恢复：完整性校验 + 悬空执行回滚 + 过期选择标记。"""
+        """启动恢复：完整性校验 + 悬空执行恢复 + 过期选择标记。"""
         errors = self.verify_all_integrity()
+        recovered: List[int] = []
         rolled_back: List[int] = []
         if not errors:
             with self._lock:
@@ -197,8 +311,11 @@ class Store:
                         "SELECT * FROM executions WHERE state='EXECUTING'"
                     ).fetchall()
                     for ex in dangling:
-                        self._rollback_executing_locked(ex, now_ms)
-                        rolled_back.append(ex["id"])
+                        outcome = self._recover_executing_locked(ex, now_ms)
+                        if outcome == "recovering":
+                            recovered.append(ex["id"])
+                        else:
+                            rolled_back.append(ex["id"])
                     # 到点未失效选择标记过期，并同步重算 MAC。
                     due = self.conn.execute(
                         "SELECT * FROM selections WHERE status='ACTIVE'"
@@ -216,6 +333,7 @@ class Store:
                     self.conn.execute("ROLLBACK")
                     raise
         return {"integrity_errors": errors,
+                "recovered_executions": recovered,
                 "rolled_back_executions": rolled_back}
 
     # ---------- 查询 ----------

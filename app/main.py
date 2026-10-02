@@ -24,11 +24,14 @@ def main() -> int:
     if recovery["integrity_errors"]:
         log.error("启动恢复发现无法校验的持久记录: %s",
                   recovery["integrity_errors"])
+    if recovery["recovered_executions"]:
+        log.warning("恢复悬空执行为 RECOVERING（待重试无副作用确认）: %s",
+                    recovery["recovered_executions"])
     if recovery["rolled_back_executions"]:
-        log.warning("回滚悬空执行: %s",
+        log.warning("回滚重启时已过期的悬空执行: %s",
                     recovery["rolled_back_executions"])
 
-    device = PayloadDevice()
+    device = PayloadDevice(config.device_journal_path)
     service = DutyService(store, device, config)
     server = build_server(service, config.http_host, config.http_port)
     log.info("值班系统监听 %s:%s (db=%s)", config.http_host,
