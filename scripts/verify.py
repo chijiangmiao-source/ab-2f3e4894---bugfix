@@ -9,7 +9,9 @@
      - 选择—执行全流程、重传回放与字段冲突、异操作标识拒绝；
      - 两个并发执行竞争同一有效选择（仅一个首次成功、其余回放同一结果）；
      - 过期选择不得执行、旧选择不复活；
-     - 结果落盘“前”注入中断并重启 -> 恢复为可安全重试的未执行态并能重试成功；
+     - 结果落盘“前”注入中断并重启 -> 设备已实际驱动：恢复识别为首次操作的
+       延续（CONSUMED/UNKNOWN），同一 op_id 重试只确认首次结果、不二次下发；
+       以跨进程驱动审计断言“首次动作 + 恢复重试”合计只实际驱动一次；
      - 结果落盘“后”注入中断并重启 -> 恢复为可回放的已执行态且回放同一结果。
 
 全部通过退出码 0，任一失败退出码 1。
@@ -56,7 +58,8 @@ class Server:
 
     def __init__(self, db_dir: str, port: int,
                  crash_before: bool = False, crash_after: bool = False,
-                 mac_key: str = "verify-secret") -> None:
+                 mac_key: str = "verify-secret",
+                 audit_path: str | None = None) -> None:
         env = dict(os.environ)
         env.update({
             "DUTY_DB_PATH": os.path.join(db_dir, "duty.db"),
@@ -66,6 +69,9 @@ class Server:
             "DUTY_LOG_LEVEL": "ERROR",
             "CRASH_BEFORE_PERSIST": "1" if crash_before else "",
             "CRASH_AFTER_PERSIST": "1" if crash_after else "",
+            # 跨进程“实际驱动载荷”审计：每次真正下发追加并 fsync 一行，
+            # 供断电恢复验收在进程重启后统计真实下发总次数。
+            "DUTY_DRIVE_AUDIT_PATH": audit_path or "",
         })
         self.env = env
         self.port = port
@@ -336,74 +342,113 @@ def scenario_expiry(target) -> None:
            new["id"] != created["id"] and True)
 
 
+def _read_drive_audit(path: str) -> list[dict]:
+    if not path or not os.path.exists(path):
+        return []
+    rows: list[dict] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
 def scenario_crash_before(db_dir: str) -> None:
-    print("\n- 断电恢复①：执行结果落盘前中断并重启")
+    print("\n- 断电恢复①：设备已驱动、结果落盘前中断并重启（核心回归）")
     port = free_port()
-    db_file = os.path.join(db_dir, "duty.db")
-    srv = Server(db_dir, port, crash_before=True)
+    # 两个进程共用同一份跨进程“实际驱动”审计，统计真实下发总次数。
+    audit = os.path.join(db_dir, "drive-audit.jsonl")
+    srv = Server(db_dir, port, crash_before=True, audit_path=audit)
     srv.start()
+    summary = "落盘前断电指令"
     try:
         sel = {"device_id": "SAT-P1", "op_id": "OP-PRE",
-               "summary": "落盘前断电指令",
-               "expires_at_ms": now_ms() + 60_000}
+               "summary": summary, "expires_at_ms": now_ms() + 60_000}
         st, created = http_request(srv.port, "POST",
                                    "/api/v1/selections", sel)
         record("① 建立选择", st == 201, f"{st} {created}")
-        # 服务应在响应途中以退出码 121 硬中断。
-        st, _ = http_request(srv.port, "POST", "/api/v1/executions",
-                             {"device_id": "SAT-P1", "op_id": "OP-PRE",
-                              "summary": "落盘前断电指令"},
-                             expect_disconnect=True)
+        # 服务应在响应途中以退出码 121 硬中断（设备已驱动、T2 前）。
+        http_request(srv.port, "POST", "/api/v1/executions",
+                     {"device_id": "SAT-P1", "op_id": "OP-PRE",
+                      "summary": summary},
+                     expect_disconnect=True)
         record("① 注入中断后进程退出码 121",
                srv.wait_exit(121), f"poll={srv.proc.poll()}")
     finally:
         if srv.proc and srv.proc.poll() is None:
             srv.proc.kill()
 
-    # 直接从磁盘确认：T1 已落盘（重启前存在悬空执行的证据由恢复日志处理）。
-    # 重启（不带崩溃注入）。
-    srv2 = Server(db_dir, port)
+    drives_after_crash = _read_drive_audit(audit)
+    pre_drives = [d for d in drives_after_crash if d["op_id"] == "OP-PRE"]
+    record("① 崩溃前载荷已被实际驱动恰好 1 次",
+           len(pre_drives) == 1, f"drives={len(pre_drives)}")
+    first_receipt = pre_drives[0]["receipt"] if pre_drives else None
+
+    # 重启（不带崩溃注入），仍写同一份审计；恢复必须保留而非回滚已驱动执行。
+    srv2 = Server(db_dir, port, audit_path=audit)
     srv2.start()
     try:
         qs = urlencode({"device_id": "SAT-P1"})
         st, got = http_request(srv2.port, "GET",
                                f"/api/v1/selections?{qs}")
-        record("① 重启后恢复为可安全重试的未执行态 (ACTIVE)",
-               st == 200 and got["status"] == "ACTIVE", f"{st} {got}")
+        record("① 重启后识别为首次操作延续 (CONSUMED，非 ACTIVE 重发)",
+               st == 200 and got["status"] == "CONSUMED", f"{st} {got}")
+        # 以原来的稳定操作标识和相同内容重试。
         st2, exe = http_request(srv2.port, "POST", "/api/v1/executions",
                                 {"device_id": "SAT-P1",
                                  "op_id": "OP-PRE",
-                                 "summary": "落盘前断电指令"})
-        record("① 安全重试成功 EXECUTED（首次结果）",
+                                 "summary": summary})
+        record("① 恢复重试确认首次结果 (EXECUTED, replayed)",
                st2 == 200 and exe["state"] == "EXECUTED"
-               and not exe.get("replayed"), f"{st2} {exe}")
+               and exe.get("replayed") is True
+               and exe["result"].get("receipt") == first_receipt,
+               f"{st2} {exe}")
+        # 再重传一次：仍回放同一终态，不产生新驱动。
+        st3, exe3 = http_request(srv2.port, "POST", "/api/v1/executions",
+                                 {"device_id": "SAT-P1", "op_id": "OP-PRE",
+                                  "summary": summary})
+        record("① 再次重传仍回放同一业务结论",
+               st3 == 200 and exe3.get("replayed") is True
+               and exe3["id"] == exe["id"]
+               and exe3["result"] == exe["result"], f"{st3} {exe3}")
     finally:
         srv2.stop()
+
+    # 关键验收：首次动作 + 恢复重试（含再重传）合计只产生一次实际驱动，
+    # 且该保证跨进程重启成立。
+    drives_final = [d for d in _read_drive_audit(audit)
+                    if d["op_id"] == "OP-PRE"]
+    record("① 首次动作与恢复重试合计只实际驱动一次（跨进程重启）",
+           len(drives_final) == 1
+           and drives_final[0]["receipt"] == first_receipt,
+           f"total_drives={len(drives_final)}")
 
 
 def scenario_crash_after(db_dir: str) -> None:
     print("\n- 断电恢复②：执行结果落盘后中断并重启")
     port = free_port()
-    srv = Server(db_dir, port, crash_after=True)
+    audit = os.path.join(db_dir, "drive-audit.jsonl")
+    srv = Server(db_dir, port, crash_after=True, audit_path=audit)
     srv.start()
+    summary = "落盘后断电指令"
     try:
         sel = {"device_id": "SAT-P2", "op_id": "OP-POST",
-               "summary": "落盘后断电指令",
-               "expires_at_ms": now_ms() + 60_000}
+               "summary": summary, "expires_at_ms": now_ms() + 60_000}
         st, created = http_request(srv.port, "POST",
                                    "/api/v1/selections", sel)
         record("② 建立选择", st == 201, f"{st} {created}")
-        st, _ = http_request(srv.port, "POST", "/api/v1/executions",
-                             {"device_id": "SAT-P2", "op_id": "OP-POST",
-                              "summary": "落盘后断电指令"},
-                             expect_disconnect=True)
+        http_request(srv.port, "POST", "/api/v1/executions",
+                     {"device_id": "SAT-P2", "op_id": "OP-POST",
+                      "summary": summary},
+                     expect_disconnect=True)
         record("② 注入中断后进程退出码 122",
                srv.wait_exit(122), f"poll={srv.proc.poll()}")
     finally:
         if srv.proc and srv.proc.poll() is None:
             srv.proc.kill()
 
-    srv2 = Server(db_dir, port)
+    srv2 = Server(db_dir, port, audit_path=audit)
     srv2.start()
     try:
         qs = urlencode({"device_id": "SAT-P2"})
@@ -414,7 +459,7 @@ def scenario_crash_after(db_dir: str) -> None:
         st2, exe = http_request(srv2.port, "POST", "/api/v1/executions",
                                 {"device_id": "SAT-P2",
                                  "op_id": "OP-POST",
-                                 "summary": "落盘后断电指令"})
+                                 "summary": summary})
         # 从磁盘读取首次结果收据做比对。
         conn = sqlite3.connect(os.path.join(db_dir, "duty.db"))
         row = conn.execute(
@@ -437,6 +482,14 @@ def scenario_crash_after(db_dir: str) -> None:
                == "SELECTION_ALREADY_EXECUTED", f"{st3} {body3}")
     finally:
         srv2.stop()
+
+    # 回放同样不得产生第二次实际驱动。
+    drives_final = [d for d in _read_drive_audit(audit)
+                    if d["op_id"] == "OP-POST"]
+    record("② 首次下发与重启后回放合计只实际驱动一次（跨进程重启）",
+           len(drives_final) == 1
+           and drives_final[0]["receipt"] == first_receipt,
+           f"total_drives={len(drives_final)}")
 
 
 def scenario_tamper_health(db_dir: str, target) -> None:

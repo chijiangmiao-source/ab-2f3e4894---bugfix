@@ -33,15 +33,23 @@
 
 ### 断电恢复
 执行落盘分两段事务（WAL + `synchronous=FULL`）：
-- **T1**：写 `execution(EXECUTING)` 并把选择置为 `CONSUMED`（同一事务）。
-- **T2**：写 `execution(EXECUTED, result)`。
+- **T1**：写 `execution(EXECUTING)`、把选择置为 `CONSUMED`，并在**同一事务**
+  写设备驱动台账 `device_drive_ledger(CLAIMED)`；T1 提交后才真正驱动载荷。
+- **T2**：写 `execution(EXECUTED, result)`，台账同事务置为 `CONFIRMED`。
 
 | 注入点 | 磁盘状态 | 重启恢复 |
 |--------|----------|----------|
-| 结果落盘**前**（设备已驱动、T2 前） | 悬空 EXECUTING + CONSUMED | 回滚为 **ACTIVE 未执行**；设备按 op_id 幂等，可安全重试并得到同一确定结果 |
-| 结果落盘**后**（T2 提交后） | EXECUTED + CONSUMED | 恢复为 **CONSUMED 已执行**，重传回放同一结果 |
+| 结果落盘**前**（设备已驱动、T2 前） | 悬空 EXECUTING + CONSUMED + 台账 CLAIMED | **不回滚**：保留为 **CONSUMED + execution UNKNOWN（已驱动、结果未见证）**；同一 `op_id` 的恢复重试被识别为首次操作的延续，只**确认/回放第一次的确定结果，绝不再次下发**高危命令 |
+| 结果落盘**后**（T2 提交后） | EXECUTED + CONSUMED + 台账 CONFIRMED | 恢复为 **CONSUMED 已执行**，重传回放同一结果 |
 
-- 启动恢复会：校验全部持久记录 → 回滚所有悬空 EXECUTING → 标记到点选择过期。
+> 设备“是否已实际驱动”以随 T1 持久化的**设备驱动台账**为准，该承诺跨
+> 进程重启有效，而不是依赖设备模拟器的进程内计数。因此即使设备动作已
+> 发生、本地结果尚未落盘即断电，恢复后的安全重试也不会产生第二次实际
+> 驱动；只有在查无驱动承诺（理论窗口/旧数据）时才回滚为 ACTIVE 重执。
+
+- 启动恢复会：校验全部持久记录 → 对每条悬空 EXECUTING 按台账裁决
+  （有承诺保留为 UNKNOWN，无承诺才回滚）→ 标记到点的 **ACTIVE** 选择过期
+  （已 CONSUMED 的选择即使越过失效时刻也不回滚，因其高危动作可能已发生）。
 - 每条记录带 **HMAC-SHA256**（绑定表名与全部字段，`DUTY_MAC_KEY`）。
   记录被篡改/缺失 MAC/不可读时：
   - `GET /health` 返回 **503 `degraded`** 并列出 `integrity_errors`；

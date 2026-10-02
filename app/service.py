@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, Optional
 
 from .device import PayloadDevice
-from .store import Store
+from .store import STATE_EXECUTED, STATE_UNKNOWN, Store
 
 
 def now_ms() -> int:
@@ -166,24 +166,58 @@ class DutyService:
         return self._selection_json(row, replayed=False)
 
     # ---------- 执行 ----------
+    def _confirm_unknown(self, row: Any, unknown: Any,
+                         request_id: Optional[str]) -> Dict[str, Any]:
+        """确认一条“设备已驱动、结果未落盘”的执行（断电恢复后的同一操作）。
+
+        这是首消费在跨进程意义上的延续，不是一次新的执行：设备动作在崩溃
+        前已经发生，此处只用与首次下发完全一致的确定性结果把终态补落盘，
+        绝不再次进入 device.execute 产生第二次实际驱动。
+        """
+        claim = self.store.drive_claim_for_selection(row["id"])
+        if claim is None:
+            # 无驱动承诺却存在 UNKNOWN：防御性 fail-closed，宁可提示稍后重试，
+            # 也不允许再次下发高危命令。
+            raise ApiError(409, "SELECTION_CONSUMED",
+                           "选择已被消费且暂无最终结果，请稍后重试")
+        # 承诺内容必须与当前选择一致（三要素），否则不补结果也不重发。
+        if (claim["device_id"], claim["op_id"], claim["summary"]) != \
+                (row["device_id"], row["op_id"], row["summary"]):
+            raise ApiError(409, "SELECTION_CONSUMED",
+                           "选择已被消费，且驱动承诺与当前内容不一致")
+        result = PayloadDevice.deterministic_result(
+            row["device_id"], row["op_id"], row["summary"])
+        final_row = self.store.confirm_unknown_execution(
+            unknown["id"], result, self.now())
+        if request_id:
+            self.store.ensure_execution_request_index(
+                request_id, final_row["id"])
+        return self._execution_json(final_row, replayed=True)
+
     def _verdict_for_current(self, row: Any,
                              request_id: Optional[str] = None
                              ) -> Dict[str, Any]:
-        """对一条非 ACTIVE（或刚过期）选择给出终态裁决：回放或拒绝。"""
-        if row["status"] == "EXPIRED" or row["expires_at_ms"] <= self.now():
-            raise ApiError(410, "SELECTION_EXPIRED",
-                           "选择已过失效时刻，不得执行")
+        """对一条非 ACTIVE（或刚过期）选择给出终态裁决：确认、回放或拒绝。"""
         if row["status"] == "CONSUMED":
             final = self.store.latest_execution_for_selection(row["id"])
-            if final is not None and final["state"] == "EXECUTED":
+            # 设备已驱动而结果未见证（结果落盘前断电、重启恢复保留）：
+            # 优先确认首次结果——即使已越过失效时刻，高危动作已经发生，
+            # 必须让同一次业务操作收敛到一致结论，且不得再次下发。
+            if final is not None and final["state"] == STATE_UNKNOWN:
+                return self._confirm_unknown(row, final, request_id)
+            if final is not None and final["state"] == STATE_EXECUTED:
                 # 竞争失败方/重传：回放同一最终结果，而非处理中。
                 # 竞争失败方若携带请求标识，补登记幂等索引指向同一终态记录。
                 if request_id and final["request_id"] != request_id:
                     self.store.ensure_execution_request_index(
                         request_id, final["id"])
                 return self._execution_json(final, replayed=True)
+        if row["status"] == "EXPIRED" or row["expires_at_ms"] <= self.now():
+            raise ApiError(410, "SELECTION_EXPIRED",
+                           "选择已过失效时刻，不得执行")
+        if row["status"] == "CONSUMED":
             # 进程内并发下不可达：消费锁串行化了 T1..T2；
-            # 跨重启的悬空 EXECUTING 已在启动恢复时回滚。
+            # 跨重启的悬空 EXECUTING 已在启动恢复时裁决（确认或回滚）。
             raise ApiError(409, "SELECTION_CONSUMED",
                            "选择已被消费且暂无最终结果，请稍后重试")
         raise ApiError(409, "SELECTION_NOT_ACTIVE",
@@ -238,25 +272,28 @@ class DutyService:
                     current["expires_at_ms"] <= self.now():
                 return self._verdict_for_current(current, request_id)
 
-            # T1：EXECUTING + CONSUMED 原子落盘，首次消费权随之确定。
+            # T1：EXECUTING + CONSUMED + 设备驱动台账 CLAIMED 同事务落盘，
+            # 首次消费权与“即将实际下发”的承诺一并 durable。
             execution_id = self.store.insert_executing(
                 current, request_id, self.now())
 
-            # 驱动载荷；设备按稳定操作标识幂等、结果确定，可安全重放。
+            # 台账已 durable，此刻才真正驱动载荷；设备结果由三要素确定。
             result = self.device.execute(device_id, op_id, summary)
 
             # —— 中断注入点①：执行结果落盘“之前” ——
-            # 设备已驱动、结果已产生，但 T2 尚未提交；
-            # 重启后恢复为可安全重试的未执行态，重试得到同一确定结果。
+            # 设备已实际驱动、结果已产生，但 T2 尚未提交；台账 CLAIMED 已
+            # 随 T1 durable。重启恢复会把该执行保留为 UNKNOWN（已驱动、结果
+            # 未见证），恢复后的同一 op_id 重试只确认首次结果，绝不二次下发。
             if self.config.crash_before_persist:
                 self._crash(121)
 
             try:
-                # T2：执行结果落盘提交。
+                # T2：执行结果落盘提交，台账同步 CONFIRMED。
                 final_row = self.store.finish_execution(
                     execution_id, result, self.now())
             except Exception:
-                # 落盘失败：回到可安全重试的未执行态，不挂起选择。
+                # 落盘失败：设备已经驱动，台账承诺已存在，恢复/回滚路径会
+                # 保留为 UNKNOWN 而非退回 ACTIVE，后续重试确认结果、不重发。
                 self.store.rollback_executing(execution_id, self.now())
                 raise
 
