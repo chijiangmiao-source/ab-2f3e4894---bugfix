@@ -1,0 +1,2 @@
+# 值班系统仅依赖 Python 3.11 标准库（http.server / sqlite3 / hmac / threading），
+# 无需安装任何第三方包。此文件保留用于构建占位。

@@ -1,0 +1,42 @@
+services:
+  # 值班服务：选择—执行 HTTP API + SQLite 持久化（/data 为独立卷）。
+  duty:
+    build: .
+    image: ground-duty:latest
+    command: ["python", "-m", "app.main"]
+    environment:
+      DUTY_DB_PATH: /data/duty.db
+      DUTY_HTTP_HOST: 0.0.0.0
+      DUTY_HTTP_PORT: "8080"
+      # 生产部署应通过 .env / secrets 注入强密钥。
+      DUTY_MAC_KEY: ${DUTY_MAC_KEY:-ground-station-duty-secret}
+    volumes:
+      - duty-data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      # /health 在存在无法校验的持久记录时返回 503，探针据此判失败。
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # 一次性验收服务：代码测试 + 构建检查 + API/HTTP 冒烟（含并发、过期、
+  # 两处断电恢复）。执行结束即退出，退出码即验收结果（0 通过 / 1 失败）。
+  verify:
+    build: .
+    image: ground-duty:latest
+    command: ["python", "scripts/verify.py"]
+    environment:
+      # 基础流程/并发/过期冒烟针对真实 duty 容器；
+      # 健康降级与两处断电恢复在本容器内以真实子进程注入中断完成。
+      DUTY_BASE_URL: http://duty:8080
+    depends_on:
+      duty:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  duty-data:
